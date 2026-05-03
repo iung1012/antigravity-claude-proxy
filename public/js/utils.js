@@ -6,26 +6,22 @@ window.utils = {
     // Shared Request Wrapper
     async request(url, options = {}, webuiPassword = '') {
         options.headers = options.headers || {};
-        if (webuiPassword) {
+
+        // Prefer session token; fall back to legacy password header
+        const sessionToken = localStorage.getItem('ag_session_token');
+        if (sessionToken) {
+            options.headers['x-session-token'] = sessionToken;
+        } else if (webuiPassword) {
             options.headers['x-webui-password'] = webuiPassword;
         }
 
-        let response = await fetch(url, options);
+        const response = await fetch(url, options);
 
         if (response.status === 401) {
-            const store = Alpine.store('global');
-            const password = prompt(store ? store.t('enterPassword') : 'Enter Web UI Password:');
-            if (password) {
-                // Return new password so caller can update state
-                // This implies we need a way to propagate the new password back
-                // For simplicity in this functional utility, we might need a callback or state access
-                // But generally utils shouldn't probably depend on global state directly if possible
-                // let's stick to the current logic but wrapped
-                localStorage.setItem('antigravity_webui_password', password);
-                options.headers['x-webui-password'] = password;
-                response = await fetch(url, options);
-                return { response, newPassword: password };
-            }
+            // Show login overlay instead of native prompt()
+            const store = typeof Alpine !== 'undefined' ? Alpine.store('global') : null;
+            if (store) store.showLogin = true;
+            return { response, newPassword: null };
         }
 
         return { response, newPassword: null };

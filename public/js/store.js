@@ -5,7 +5,10 @@
 
 document.addEventListener('alpine:init', () => {
     Alpine.store('global', {
-        init() {
+        async init() {
+            // Check authentication before anything else
+            await this.checkAuth();
+
             // Hash-based routing
             const validTabs = ['dashboard', 'models', 'accounts', 'logs', 'settings'];
             const validSettingsTabs = ['ui', 'claude', 'models', 'server'];
@@ -77,6 +80,69 @@ document.addEventListener('alpine:init', () => {
         activeTab: 'dashboard',
         settingsTab: 'ui',
         webuiPassword: localStorage.getItem('antigravity_webui_password') || '',
+
+        // Auth state
+        showLogin: false,
+        loginPassword: '',
+        loginError: '',
+        loginLoading: false,
+
+        async checkAuth() {
+            try {
+                const token = localStorage.getItem('ag_session_token') || '';
+                const res = await fetch('/api/auth/check', {
+                    headers: token ? { 'x-session-token': token } : {}
+                });
+                const data = await res.json();
+                if (data.requiresPassword && !data.authenticated) {
+                    this.showLogin = true;
+                }
+            } catch (_) {
+                // network error — allow app to load and fail naturally
+            }
+        },
+
+        async login() {
+            this.loginLoading = true;
+            this.loginError = '';
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: this.loginPassword })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    if (data.token) localStorage.setItem('ag_session_token', data.token);
+                    this.showLogin = false;
+                    this.loginPassword = '';
+                    // Trigger data refresh after login
+                    if (typeof Alpine !== 'undefined') {
+                        Alpine.store('data')?.fetchData?.();
+                    }
+                } else {
+                    this.loginError = data.error || this.t('loginInvalidPassword');
+                }
+            } catch (_) {
+                this.loginError = this.t('loginConnError');
+            } finally {
+                this.loginLoading = false;
+            }
+        },
+
+        async logout() {
+            const token = localStorage.getItem('ag_session_token');
+            if (token) {
+                try {
+                    await fetch('/api/auth/logout', {
+                        method: 'POST',
+                        headers: { 'x-session-token': token }
+                    });
+                } catch (_) {}
+                localStorage.removeItem('ag_session_token');
+            }
+            this.showLogin = true;
+        },
 
         // i18n
         lang: localStorage.getItem('app_lang') || 'en',

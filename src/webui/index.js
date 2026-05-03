@@ -27,6 +27,20 @@ import { getPackageVersion } from '../utils/helpers.js';
 // Get package version
 const packageVersion = getPackageVersion();
 
+// Session store: token -> { expiry }
+const sessions = new Map();
+
+function generateToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+function cleanupSessions() {
+    const now = Date.now();
+    for (const [token, session] of sessions.entries()) {
+        if (session.expiry <= now) sessions.delete(token);
+    }
+}
+
 // OAuth state storage (state -> { server, verifier, state, timestamp })
 // Maps state ID to active OAuth flow data
 const pendingOAuthFlows = new Map();
@@ -109,7 +123,7 @@ async function addAccount(accountData) {
 }
 
 /**
- * Auth Middleware - Optional password protection for WebUI
+ * Auth Middleware - Session token + optional legacy password header support
  * Password can be set via WEBUI_PASSWORD env var or config.json
  */
 function createAuthMiddleware() {
@@ -117,23 +131,39 @@ function createAuthMiddleware() {
         const password = config.webuiPassword;
         if (!password) return next();
 
-        // Determine if this path should be protected
-        const isApiRoute = req.path.startsWith('/api/');
-        const isAuthUrl = req.path === '/api/auth/url';
-        const isConfigGet = req.path === '/api/config' && req.method === 'GET';
-        const isProtected = (isApiRoute && !isAuthUrl && !isConfigGet) || req.path === '/account-limits' || req.path === '/health';
+        // Always-public paths
+        const isPublicPath =
+            req.path === '/api/auth/login' ||
+            req.path === '/api/auth/logout' ||
+            req.path === '/api/auth/check' ||
+            req.path === '/api/auth/url' ||
+            (req.path === '/api/config' && req.method === 'GET');
 
-        if (isProtected) {
-            const providedPassword = req.headers['x-webui-password'] || req.query.password || '';
+        if (isPublicPath) return next();
+
+        // Determine if this path should be protected
+        const isProtected = req.path.startsWith('/api/') || req.path === '/account-limits' || req.path === '/health';
+        if (!isProtected) return next();
+
+        // Check session token (preferred)
+        const token = req.headers['x-session-token'];
+        if (token) {
+            const session = sessions.get(token);
+            if (session && session.expiry > Date.now()) return next();
+            if (session) sessions.delete(token); // expired
+        }
+
+        // Legacy: support raw password header for backwards compatibility
+        const providedPassword = req.headers['x-webui-password'] || req.query.password || '';
+        if (providedPassword) {
             const expected = Buffer.from(password);
             const provided = Buffer.from(providedPassword);
             const match = provided.length === expected.length &&
                 crypto.timingSafeEqual(expected, provided);
-            if (!match) {
-                return res.status(401).json({ status: 'error', error: 'Unauthorized: Password required' });
-            }
+            if (match) return next();
         }
-        next();
+
+        return res.status(401).json({ status: 'error', error: 'Unauthorized: Please sign in' });
     };
 }
 
@@ -260,6 +290,60 @@ function validateConfigFields(input) {
 export function mountWebUI(app, dirname, accountManager) {
     // Apply auth middleware
     app.use(createAuthMiddleware());
+
+    // Periodic session cleanup (every hour)
+    setInterval(cleanupSessions, 60 * 60 * 1000);
+
+    // ==========================================
+    // Auth API (public — no session required)
+    // ==========================================
+
+    /** GET /api/auth/check - Check if session is valid */
+    app.get('/api/auth/check', (req, res) => {
+        const password = config.webuiPassword;
+        if (!password) return res.json({ requiresPassword: false, authenticated: true });
+
+        const token = req.headers['x-session-token'];
+        if (token) {
+            const session = sessions.get(token);
+            if (session && session.expiry > Date.now()) {
+                return res.json({ requiresPassword: true, authenticated: true });
+            }
+        }
+        res.json({ requiresPassword: true, authenticated: false });
+    });
+
+    /** POST /api/auth/login - Verify password and return session token */
+    app.post('/api/auth/login', (req, res) => {
+        const password = config.webuiPassword;
+        if (!password) return res.json({ status: 'ok', token: null });
+
+        const { password: provided } = req.body;
+        const expected = Buffer.from(password);
+        const providedBuf = Buffer.from(provided || '');
+        const match = providedBuf.length === expected.length &&
+            crypto.timingSafeEqual(expected, providedBuf);
+
+        if (!match) {
+            return res.status(401).json({ status: 'error', error: 'Invalid password' });
+        }
+
+        cleanupSessions();
+        const token = generateToken();
+        sessions.set(token, { expiry: Date.now() + 24 * 60 * 60 * 1000 }); // 24h
+        logger.info('[WebUI] New session created');
+        res.json({ status: 'ok', token });
+    });
+
+    /** POST /api/auth/logout - Invalidate session token */
+    app.post('/api/auth/logout', (req, res) => {
+        const token = req.headers['x-session-token'];
+        if (token) {
+            sessions.delete(token);
+            logger.info('[WebUI] Session invalidated');
+        }
+        res.json({ status: 'ok' });
+    });
 
     // Serve static files from public directory
     app.use(express.static(path.join(dirname, '../public')));
@@ -1234,12 +1318,28 @@ export function mountWebUI(app, dirname, accountManager) {
      */
     app.post('/api/auth/complete', async (req, res) => {
         try {
-            const { callbackInput, state } = req.body;
+            const { callbackInput, state: clientState } = req.body;
 
-            if (!callbackInput || !state) {
+            if (!callbackInput) {
                 return res.status(400).json({
                     status: 'error',
-                    error: 'Missing callbackInput or state'
+                    error: 'Missing callbackInput'
+                });
+            }
+
+            // Extract code and state from the callback URL
+            const { extractCodeFromInput, completeOAuthFlow } = await import('../auth/oauth.js');
+            const { code, state: urlState } = extractCodeFromInput(callbackInput);
+
+            // Prefer state from the callback URL (authoritative) over client-sent state.
+            // This handles the case where the user used the popup button (generating one flow)
+            // but is completing via the manual mode form (which has a different authState).
+            const state = urlState || clientState;
+
+            if (!state) {
+                return res.status(400).json({
+                    status: 'error',
+                    error: 'Missing state - paste the full callback URL including ?code=...&state=...'
                 });
             }
 
@@ -1253,10 +1353,6 @@ export function mountWebUI(app, dirname, accountManager) {
             }
 
             const { verifier, abortServer } = flowData;
-
-            // Extract code from input (URL or raw code)
-            const { extractCodeFromInput, completeOAuthFlow } = await import('../auth/oauth.js');
-            const { code } = extractCodeFromInput(callbackInput);
 
             // Complete the OAuth flow
             const accountData = await completeOAuthFlow(code, verifier);
